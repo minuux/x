@@ -31,18 +31,19 @@ import {
 } from '@ant-design/x';
 import type { ComponentProps } from '@ant-design/x-markdown';
 import XMarkdown from '@ant-design/x-markdown';
-import type { DefaultMessageInfo } from '@ant-design/x-sdk';
+import { useXConversations } from '@ant-design/x-sdk';
 import {
-  DeepSeekChatProvider,
-  SSEFields,
-  useXChat,
-  useXConversations,
-  XModelMessage,
-  XModelParams,
-  XModelResponse,
-  XRequest,
-} from '@ant-design/x-sdk';
-import { Avatar, Button, Flex, type GetProp, message, Pagination, Space } from 'antd';
+  Avatar,
+  Button,
+  Card,
+  Descriptions,
+  Flex,
+  type GetProp,
+  message,
+  Pagination,
+  Space,
+  Tag,
+} from 'antd';
 import { createStyles } from 'antd-style';
 import dayjs from 'dayjs';
 import React, { useRef, useState } from 'react';
@@ -143,14 +144,9 @@ const useStyle = createStyles(({ token, css }) => {
       padding: ${token.paddingLG}px;
       box-sizing: border-box;
     `,
-    // sender 样式
     sender: css`
       width: 100%;
       max-width: 840px;
-    `,
-    speechButton: css`
-      font-size: 18px;
-      color: ${token.colorText} !important;
     `,
     senderPrompt: css`
       width: 100%;
@@ -158,38 +154,18 @@ const useStyle = createStyles(({ token, css }) => {
       margin: 0 auto;
       color: ${token.colorText};
     `,
+    toolPanel: css`
+      width: 100%;
+      max-width: 840px;
+    `,
+    toolHint: css`
+      color: ${token.colorTextSecondary};
+      font-size: 12px;
+    `,
   };
 });
 
 // ==================== Static Config ====================
-const HISTORY_MESSAGES: {
-  [key: string]: DefaultMessageInfo<ChatMessage>[];
-} = {
-  'default-1': [
-    {
-      message: { role: 'user', content: locale.howToQuicklyInstallAndImportComponents },
-      status: 'success',
-    },
-    {
-      message: {
-        role: 'assistant',
-        content: locale.aiMessage_2,
-      },
-      status: 'success',
-    },
-  ],
-  'default-2': [
-    { message: { role: 'user', content: locale.newAgiHybridInterface }, status: 'success' },
-    {
-      message: {
-        role: 'assistant',
-        content: locale.aiMessage_1,
-      },
-      status: 'success',
-    },
-  ],
-};
-
 const DEFAULT_CONVERSATIONS_ITEMS = [
   {
     key: 'default-0',
@@ -279,17 +255,17 @@ const SENDER_PROMPTS: GetProp<typeof Prompts, 'items'> = [
   },
   {
     key: '2',
-    description: locale.components,
-    icon: <ProductOutlined />,
+    description: '帮我查询杭州天气',
+    icon: <GlobalOutlined />,
   },
   {
     key: '3',
-    description: locale.richGuide,
+    description: '帮我查询 ANTD 股票',
     icon: <FileSearchOutlined />,
   },
   {
     key: '4',
-    description: locale.installationIntroduction,
+    description: '帮我查询用户资料',
     icon: <AppstoreAddOutlined />,
   },
 ];
@@ -317,21 +293,220 @@ const THOUGHT_CHAIN_CONFIG = {
   },
 };
 
-// ==================== Type ====================
-interface ChatMessage extends XModelMessage {
+// ==================== Types ====================
+type ToolName = 'get_weather' | 'get_stock_price' | 'get_user_profile';
+
+type ToolDefinition = {
+  name: ToolName;
+  description: string;
+  inputSchema: Record<string, any>;
+};
+
+type ToolCallState = 'pending' | 'running' | 'success' | 'error';
+
+type AssistantTextContent = {
+  type: 'text';
+  text: string;
+};
+
+type AssistantToolCallContent = {
+  type: 'tool-call';
+  toolName: ToolName;
+  arguments: Record<string, any>;
+  state: ToolCallState;
+};
+
+type AssistantToolResultContent = {
+  type: 'tool-result';
+  toolName: ToolName;
+  content: string;
+  structuredContent?: Record<string, any>;
+  isError?: boolean;
+};
+
+type RichAssistantContent =
+  | AssistantTextContent
+  | AssistantToolCallContent
+  | AssistantToolResultContent;
+
+type ChatContent = string | RichAssistantContent;
+
+interface ChatMessage {
+  role: 'user' | 'assistant';
+  content: ChatContent;
   extraInfo?: {
     feedback: ActionsFeedbackProps['value'];
   };
 }
 
+type OrchestratedMessage = {
+  id: string;
+  role: 'user' | 'assistant';
+  content: ChatContent;
+  status?: 'success' | 'loading' | 'error' | 'updating' | 'abort';
+  extraInfo?: ChatMessage['extraInfo'];
+};
+
+// ==================== Mock MCP Client ====================
+const MOCK_TOOLS: ToolDefinition[] = [
+  {
+    name: 'get_weather',
+    description: '获取指定城市天气信息',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        city: { type: 'string', description: '城市名称' },
+      },
+      required: ['city'],
+    },
+  },
+  {
+    name: 'get_stock_price',
+    description: '获取股票价格信息',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        symbol: { type: 'string', description: '股票代码' },
+      },
+      required: ['symbol'],
+    },
+  },
+  {
+    name: 'get_user_profile',
+    description: '获取用户资料信息',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        userId: { type: 'string', description: '用户 ID' },
+      },
+      required: ['userId'],
+    },
+  },
+];
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const mockMcpClient = {
+  async listTools(): Promise<{ tools: ToolDefinition[] }> {
+    await sleep(200);
+    return { tools: MOCK_TOOLS };
+  },
+
+  async callTool(input: {
+    name: ToolName;
+    arguments: Record<string, any>;
+  }): Promise<{
+    content: string;
+    structuredContent?: Record<string, any>;
+    isError?: boolean;
+  }> {
+    await sleep(900);
+
+    switch (input.name) {
+      case 'get_weather':
+        return {
+          content: `已获取 ${input.arguments.city || '杭州'} 的天气`,
+          structuredContent: {
+            city: input.arguments.city || '杭州',
+            condition: '多云',
+            temperature: 26,
+            humidity: '78%',
+          },
+        };
+      case 'get_stock_price':
+        return {
+          content: `已获取 ${input.arguments.symbol || 'ANTD'} 的股价`,
+          structuredContent: {
+            symbol: input.arguments.symbol || 'ANTD',
+            price: 128.5,
+            change: '+2.31%',
+            market: 'NASDAQ',
+          },
+        };
+      case 'get_user_profile':
+        return {
+          content: `已获取用户 ${input.arguments.userId || 'u_001'} 的资料`,
+          structuredContent: {
+            userId: input.arguments.userId || 'u_001',
+            name: 'Ant Design X User',
+            email: 'demo@ant.design',
+            tags: ['VIP', 'Beta'],
+          },
+        };
+      default:
+        return {
+          content: '未知工具',
+          isError: true,
+        };
+    }
+  },
+};
+
+const planToolCall = async (input: string): Promise<{
+  toolName?: ToolName;
+  args?: Record<string, any>;
+  finalText?: string;
+}> => {
+  await sleep(300);
+  const q = input.toLowerCase();
+
+  if (q.includes('天气') || q.includes('weather')) {
+    return {
+      toolName: 'get_weather',
+      args: {
+        city: input.includes('北京') ? '北京' : input.includes('上海') ? '上海' : '杭州',
+      },
+    };
+  }
+
+  if (q.includes('股票') || q.includes('stock')) {
+    return {
+      toolName: 'get_stock_price',
+      args: {
+        symbol: 'ANTD',
+      },
+    };
+  }
+
+  if (q.includes('用户') || q.includes('profile')) {
+    return {
+      toolName: 'get_user_profile',
+      args: {
+        userId: 'u_001',
+      },
+    };
+  }
+
+  return {
+    finalText: `这是普通文本回答：${input}`,
+  };
+};
+
+const summarizeToolResult = async (
+  toolName: ToolName,
+  structuredContent?: Record<string, any>,
+): Promise<string> => {
+  await sleep(300);
+
+  switch (toolName) {
+    case 'get_weather':
+      return `查询结果：${structuredContent?.city}当前${structuredContent?.condition}，气温 ${structuredContent?.temperature}°C，湿度 ${structuredContent?.humidity}。`;
+    case 'get_stock_price':
+      return `查询结果：${structuredContent?.symbol} 当前价格 ${structuredContent?.price}，涨跌幅 ${structuredContent?.change}，市场 ${structuredContent?.market}。`;
+    case 'get_user_profile':
+      return `查询结果：用户 ${structuredContent?.name}，邮箱 ${structuredContent?.email}，标签为 ${structuredContent?.tags?.join('、')}。`;
+    default:
+      return '工具调用已完成。';
+  }
+};
+
 // ==================== Context ====================
 const ChatContext = React.createContext<{
-  onReload?: ReturnType<typeof useXChat>['onReload'];
-  setMessage?: ReturnType<typeof useXChat<ChatMessage>>['setMessage'];
+  onReload?: (id?: string | number) => Promise<void>;
+  setMessage?: (id: string | number, updater: (prev?: Partial<OrchestratedMessage>) => Partial<OrchestratedMessage>) => void;
 }>({});
 
 // ==================== Sub Component ====================
-
 const ThinkComponent = React.memo((props: ComponentProps) => {
   const [title, setTitle] = React.useState(`${locale.deepThinking}...`);
   const [loading, setLoading] = React.useState(true);
@@ -349,6 +524,121 @@ const ThinkComponent = React.memo((props: ComponentProps) => {
     </Think>
   );
 });
+
+const WeatherResultCard: React.FC<{ data: Record<string, any> }> = ({ data }) => (
+  <Card size="small" title="天气结果" bordered={false}>
+    <Descriptions size="small" column={1}>
+      <Descriptions.Item label="城市">{data.city}</Descriptions.Item>
+      <Descriptions.Item label="天气">{data.condition}</Descriptions.Item>
+      <Descriptions.Item label="温度">{data.temperature}°C</Descriptions.Item>
+      <Descriptions.Item label="湿度">{data.humidity}</Descriptions.Item>
+    </Descriptions>
+  </Card>
+);
+
+const StockResultCard: React.FC<{ data: Record<string, any> }> = ({ data }) => (
+  <Card size="small" title="股票结果" bordered={false}>
+    <Descriptions size="small" column={1}>
+      <Descriptions.Item label="代码">{data.symbol}</Descriptions.Item>
+      <Descriptions.Item label="价格">{data.price}</Descriptions.Item>
+      <Descriptions.Item label="涨跌">{data.change}</Descriptions.Item>
+      <Descriptions.Item label="市场">{data.market}</Descriptions.Item>
+    </Descriptions>
+  </Card>
+);
+
+const UserProfileResultCard: React.FC<{ data: Record<string, any> }> = ({ data }) => (
+  <Card size="small" title="用户资料" bordered={false}>
+    <Descriptions size="small" column={1}>
+      <Descriptions.Item label="用户 ID">{data.userId}</Descriptions.Item>
+      <Descriptions.Item label="姓名">{data.name}</Descriptions.Item>
+      <Descriptions.Item label="邮箱">{data.email}</Descriptions.Item>
+      <Descriptions.Item label="标签">
+        <Space wrap>
+          {(data.tags || []).map((tag: string) => (
+            <Tag key={tag}>{tag}</Tag>
+          ))}
+        </Space>
+      </Descriptions.Item>
+    </Descriptions>
+  </Card>
+);
+
+const AssistantContentRender: React.FC<{
+  content: ChatContent;
+  className: string;
+  status?: string;
+}> = ({ content, className, status }) => {
+  if (typeof content === 'string') {
+    return (
+      <XMarkdown
+        paragraphTag="div"
+        components={{ think: ThinkComponent }}
+        className={className}
+        streaming={{
+          hasNextChunk: status === 'updating',
+          enableAnimation: true,
+        }}
+      >
+        {content.replace(/\n\n/g, '<br/><br/>')}
+      </XMarkdown>
+    );
+  }
+
+  if (content.type === 'text') {
+    return (
+      <XMarkdown
+        paragraphTag="div"
+        components={{ think: ThinkComponent }}
+        className={className}
+        streaming={{
+          hasNextChunk: status === 'updating',
+          enableAnimation: true,
+        }}
+      >
+        {content.text.replace(/\n\n/g, '<br/><br/>')}
+      </XMarkdown>
+    );
+  }
+
+  if (content.type === 'tool-call') {
+    return (
+      <ThoughtChain
+        items={[
+          {
+            title: `调用工具：${content.toolName}`,
+            description: `参数：${JSON.stringify(content.arguments, null, 2)}`,
+            status:
+              content.state === 'error'
+                ? 'error'
+                : content.state === 'success'
+                  ? 'success'
+                  : 'loading',
+          },
+        ]}
+      />
+    );
+  }
+
+  if (content.type === 'tool-result') {
+    if (content.isError) {
+      return <Card size="small">{content.content}</Card>;
+    }
+
+    switch (content.toolName) {
+      case 'get_weather':
+        return <WeatherResultCard data={content.structuredContent || {}} />;
+      case 'get_stock_price':
+        return <StockResultCard data={content.structuredContent || {}} />;
+      case 'get_user_profile':
+        return <UserProfileResultCard data={content.structuredContent || {}} />;
+      default:
+        return <pre>{JSON.stringify(content.structuredContent, null, 2)}</pre>;
+    }
+  }
+
+  return null;
+};
 
 const Footer: React.FC<{
   id?: string | number;
@@ -368,9 +658,7 @@ const Footer: React.FC<{
       icon: <SyncOutlined />,
       onItemClick: () => {
         if (id) {
-          context?.onReload?.(id, {
-            userAction: 'retry',
-          });
+          context?.onReload?.(id);
         }
       },
     },
@@ -420,39 +708,6 @@ const Footer: React.FC<{
   ) : null;
 };
 
-// ==================== Chat Provider ====================
-/**
- * 🔔 Please replace the BASE_URL, MODEL with your own values.
- */
-const providerCaches = new Map<string, DeepSeekChatProvider>();
-const providerFactory = (conversationKey: string) => {
-  if (!providerCaches.get(conversationKey)) {
-    providerCaches.set(
-      conversationKey,
-      new DeepSeekChatProvider({
-        request: XRequest<XModelParams, Partial<Record<SSEFields, XModelResponse>>>(
-          'https://api.x.ant.design/api/big_model_glm-4.5-flash',
-          {
-            manual: true,
-            params: {
-              stream: true,
-              thinking: {
-                type: 'disabled',
-              },
-              model: 'glm-4.5-flash',
-            },
-          },
-        ),
-      }),
-    );
-  }
-  return providerCaches.get(conversationKey);
-};
-
-const historyMessageFactory = (conversationKey: string): DefaultMessageInfo<ChatMessage>[] => {
-  return HISTORY_MESSAGES[conversationKey] || [];
-};
-
 const getRole = (className: string): BubbleListProps['role'] => ({
   assistant: {
     placement: 'start',
@@ -472,37 +727,28 @@ const getRole = (className: string): BubbleListProps['role'] => ({
     },
     footer: (content, { status, key, extraInfo }) => (
       <Footer
-        content={content}
+        content={typeof content === 'string' ? content : JSON.stringify(content)}
         status={status}
         extraInfo={extraInfo as ChatMessage['extraInfo']}
         id={key as string}
       />
     ),
-    contentRender: (content: any, { status }) => {
-      const newContent = content.replace(/\n\n/g, '<br/><br/>');
-      return (
-        <XMarkdown
-          paragraphTag="div"
-          components={{
-            think: ThinkComponent,
-          }}
-          className={className}
-          streaming={{
-            hasNextChunk: status === 'updating',
-            enableAnimation: true,
-          }}
-        >
-          {newContent}
-        </XMarkdown>
-      );
+    contentRender: (content: ChatContent, { status }) => {
+      return <AssistantContentRender content={content} className={className} status={status} />;
     },
   },
-  user: { placement: 'end' },
+  user: {
+    placement: 'end',
+    contentRender: (content: ChatContent) => {
+      if (typeof content === 'string') return content;
+      if ('type' in content && content.type === 'text') return content.text;
+      return JSON.stringify(content);
+    },
+  },
 });
 
 const Independent: React.FC = () => {
   const { styles } = useStyle();
-  // ==================== State ====================
 
   const {
     conversations,
@@ -519,51 +765,160 @@ const Independent: React.FC = () => {
   const [messageApi, contextHolder] = message.useMessage();
   const [attachmentsOpen, setAttachmentsOpen] = useState(false);
   const [attachedFiles, setAttachedFiles] = useState<GetProp<typeof Attachments, 'items'>>([]);
-
   const [inputValue, setInputValue] = useState('');
+  const [messages, setMessages] = useState<OrchestratedMessage[]>([]);
+  const [isRequesting, setIsRequesting] = useState(false);
+  const [availableTools, setAvailableTools] = useState<ToolDefinition[]>([]);
 
   const listRef = useRef<BubbleListRef>(null);
 
-  // ==================== Runtime ====================
-
-  const { onRequest, messages, isRequesting, abort, onReload, setMessage } = useXChat<ChatMessage>({
-    provider: providerFactory(activeConversationKey), // every conversation has its own provider
-    conversationKey: activeConversationKey,
-    defaultMessages: historyMessageFactory(activeConversationKey),
-    requestPlaceholder: () => {
-      return {
-        content: locale.noData,
-        role: 'assistant',
-      };
-    },
-    requestFallback: (_, { error, errorInfo, messageInfo }) => {
-      if (error.name === 'AbortError') {
-        return {
-          content: messageInfo?.message?.content || locale.requestAborted,
-          role: 'assistant',
-        };
-      }
-      return {
-        content: errorInfo?.error?.message || locale.requestFailed,
-        role: 'assistant',
-      };
-    },
-  });
-
-  // ==================== Event ====================
-  const onSubmit = (val: string) => {
-    if (!val) return;
-    onRequest({
-      messages: [{ role: 'user', content: val }],
+  React.useEffect(() => {
+    mockMcpClient.listTools().then((res) => {
+      setAvailableTools(res.tools);
     });
-    listRef.current?.scrollTo({ top: 'bottom' });
-    setActiveConversationKey(activeConversationKey);
+  }, []);
+
+  const abort = () => {
+    setIsRequesting(false);
+    messageApi.info(locale.aborted);
   };
 
-  // ==================== Nodes ====================
+  const onReload = async (id?: string | number) => {
+    if (!id) return;
+    messageApi.info(`mock retry: ${id}`);
+  };
+
+  const setMessage = (
+    id: string | number,
+    updater: (prev?: Partial<OrchestratedMessage>) => Partial<OrchestratedMessage>,
+  ) => {
+    setMessages((prev) =>
+      prev.map((item) => {
+        if (item.id !== id) return item;
+        const patch = updater(item);
+        return { ...item, ...patch, extraInfo: { ...item.extraInfo, ...patch.extraInfo } };
+      }),
+    );
+  };
+
+  const onSubmit = async (val: string) => {
+    if (!val) return;
+
+    const userId = `user_${Date.now()}`;
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: userId,
+        role: 'user',
+        content: val,
+        status: 'success',
+      },
+    ]);
+
+    setIsRequesting(true);
+    listRef.current?.scrollTo({ top: 'bottom' });
+
+    try {
+      const plan = await planToolCall(val);
+
+      if (!plan.toolName) {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `assistant_text_${Date.now()}`,
+            role: 'assistant',
+            content: {
+              type: 'text',
+              text: plan.finalText || locale.noData,
+            },
+            status: 'success',
+          },
+        ]);
+        return;
+      }
+
+      const toolCallId = `tool_call_${Date.now()}`;
+
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: toolCallId,
+          role: 'assistant',
+          content: {
+            type: 'tool-call',
+            toolName: plan.toolName,
+            arguments: plan.args || {},
+            state: 'running',
+          },
+          status: 'loading',
+        },
+      ]);
+
+      listRef.current?.scrollTo({ top: 'bottom' });
+
+      const toolResult = await mockMcpClient.callTool({
+        name: plan.toolName,
+        arguments: plan.args || {},
+      });
+
+      setMessages((prev) =>
+        prev.map((msg) =>
+          msg.id === toolCallId
+            ? {
+                ...msg,
+                content: {
+                  type: 'tool-call',
+                  toolName: plan.toolName!,
+                  arguments: plan.args || {},
+                  state: toolResult.isError ? 'error' : 'success',
+                },
+                status: toolResult.isError ? 'error' : 'success',
+              }
+            : msg,
+        ),
+      );
+
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `tool_result_${Date.now()}`,
+          role: 'assistant',
+          content: {
+            type: 'tool-result',
+            toolName: plan.toolName!,
+            content: toolResult.content,
+            structuredContent: toolResult.structuredContent,
+            isError: toolResult.isError,
+          },
+          status: toolResult.isError ? 'error' : 'success',
+        },
+      ]);
+
+      const finalAnswer = await summarizeToolResult(plan.toolName, toolResult.structuredContent);
+
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `assistant_final_${Date.now()}`,
+          role: 'assistant',
+          content: {
+            type: 'text',
+            text: finalAnswer,
+          },
+          status: 'success',
+        },
+      ]);
+    } finally {
+      setIsRequesting(false);
+      setActiveConversationKey(activeConversationKey);
+      setTimeout(() => {
+        listRef.current?.scrollTo({ top: 'bottom' });
+      }, 0);
+    }
+  };
+
   const chatSide = (
     <div className={styles.side}>
-      {/* 🌟 Logo */}
       <div className={styles.logo}>
         <img
           src="https://mdn.alipayobjects.com/huamei_iwk9zp/afts/img/A*eco6RrQhxbMAAAAAAAAAAAAADgCCAQ/original"
@@ -574,7 +929,6 @@ const Independent: React.FC = () => {
         />
         <span>Ant Design X</span>
       </div>
-      {/* 🌟 会话管理 */}
       <Conversations
         creation={{
           onClick: () => {
@@ -589,6 +943,7 @@ const Independent: React.FC = () => {
               group: locale.today,
             });
             setActiveConversationKey(now);
+            setMessages([]);
           },
         }}
         items={conversations.map(({ key, label, ...other }) => ({
@@ -635,12 +990,12 @@ const Independent: React.FC = () => {
 
   const chatList = (
     <div className={styles.chatList}>
-      {messages?.length ? (
-        /* 🌟 消息列表 */
+      {messages.length ? (
         <Bubble.List
           ref={listRef}
-          items={messages?.map((i) => ({
-            ...i.message,
+          items={messages.map((i) => ({
+            role: i.role,
+            content: i.content,
             key: i.id,
             status: i.status,
             loading: i.status === 'loading',
@@ -724,6 +1079,7 @@ const Independent: React.FC = () => {
       )}
     </div>
   );
+
   const senderHeader = (
     <Sender.Header
       title={locale.uploadFile}
@@ -747,6 +1103,7 @@ const Independent: React.FC = () => {
       />
     </Sender.Header>
   );
+
   const chatSender = (
     <Flex
       vertical
@@ -756,7 +1113,6 @@ const Independent: React.FC = () => {
         margin: 8,
       }}
     >
-      {/* 🌟 提示词 */}
       {!attachmentsOpen && (
         <Prompts
           items={SENDER_PROMPTS}
@@ -769,7 +1125,28 @@ const Independent: React.FC = () => {
           className={styles.senderPrompt}
         />
       )}
-      {/* 🌟 输入框 */}
+
+      <Card size="small" title="Mock MCP Tools" className={styles.toolPanel}>
+        <Flex vertical gap={8}>
+          <div className={styles.toolHint}>前端 Client 编排演示：静态发现工具，模型决定调用，前端执行并渲染结果。</div>
+          <Space wrap>
+            {availableTools.map((tool) => (
+              <Button
+                key={tool.name}
+                size="small"
+                onClick={() => {
+                  if (tool.name === 'get_weather') onSubmit('帮我查询杭州天气');
+                  if (tool.name === 'get_stock_price') onSubmit('帮我查询 ANTD 股票');
+                  if (tool.name === 'get_user_profile') onSubmit('帮我查询用户资料');
+                }}
+              >
+                {tool.name}
+              </Button>
+            ))}
+          </Space>
+        </Flex>
+      </Card>
+
       <Sender
         value={inputValue}
         header={senderHeader}
@@ -795,8 +1172,6 @@ const Independent: React.FC = () => {
       />
     </Flex>
   );
-
-  // ==================== Render =================
 
   return (
     <XProvider locale={locale}>
